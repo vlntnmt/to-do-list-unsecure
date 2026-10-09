@@ -1,0 +1,137 @@
+- name: Déployer l'application todolist
+  hosts: app_servers
+  become: true
+
+  vars:
+    app_user: admin
+    app_dir: /opt/todolist
+    app_branch: main
+    repo_url: https://github.com/TON-USER/to-do-list-unsecure.git
+    uv_dir: /opt/uv
+    py_dir: /opt/uv-python
+
+  tasks:
+    - name: Installer les paquets système
+      ansible.builtin.apt:
+        name: [git, python3-venv, python3-pip, acl]
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Installer uv dans son propre venv
+      ansible.builtin.pip:
+        name: uv
+        virtualenv: "{{ uv_dir }}"
+        virtualenv_command: python3 -m venv
+
+    - name: Créer le dossier de l'application
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+
+    - name: Récupérer les sources depuis GitHub (branche main)
+      ansible.builtin.git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_dir }}"
+        version: "{{ app_branch }}"
+        force: true
+      notify: Redémarrer todolist
+
+    - name: Générer requirements.txt à partir du Pipfile
+      ansible.builtin.shell: |
+        python3 - <<'EOF' > requirements.txt
+        import tomllib
+        for name, spec in tomllib.load(open("Pipfile", "rb"))["packages"].items():
+            print(name + ("" if spec == "*" or not isinstance(spec, str) else spec))
+        EOF
+      args:
+        chdir: "{{ app_dir }}"
+      changed_when: false
+
+    - name: Créer le venv Python 3.12
+      ansible.builtin.command:
+        cmd: "{{ uv_dir }}/bin/uv venv --python 3.12 {{ app_dir }}/venv"
+        creates: "{{ app_dir }}/venv/bin/python"
+      environment:
+        UV_PYTHON_INSTALL_DIR: "{{ py_dir }}"
+
+    - name: Installer les dépendances Python et Gunicorn
+      ansible.builtin.command:
+        cmd: "{{ uv_dir }}/bin/uv pip install --python {{ app_dir }}/venv/bin/python -r requirements.txt gunicorn"
+        chdir: "{{ app_dir }}"
+      changed_when: false
+
+    - name: Donner les fichiers à l'utilisateur de l'application
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        recurse: true
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+
+    - name: Configurer DEBUG (variable par serveur)
+      ansible.builtin.lineinfile:
+        path: "{{ app_dir }}/todo/settings.py"
+        regexp: '^DEBUG\s*='
+        line: "DEBUG = {{ django_debug }}"
+      notify: Redémarrer todolist
+
+    - name: Configurer ALLOWED_HOSTS
+      ansible.builtin.lineinfile:
+        path: "{{ app_dir }}/todo/settings.py"
+        regexp: '^ALLOWED_HOSTS\s*='
+        line: "ALLOWED_HOSTS = ['{{ ansible_host }}', 'localhost']"
+      notify: Redémarrer todolist
+
+    - name: Appliquer les migrations
+      ansible.builtin.command:
+        cmd: "{{ app_dir }}/venv/bin/python manage.py migrate --noinput"
+        chdir: "{{ app_dir }}"
+      become_user: "{{ app_user }}"
+      changed_when: false
+
+    - name: Créer le service systemd todolist
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/todolist.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Gunicorn - todolist
+          After=network.target
+
+          [Service]
+          User={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          ExecStart={{ app_dir }}/venv/bin/gunicorn todo.wsgi:application --bind 0.0.0.0:80 --workers 2
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Redémarrer todolist
+
+    - name: Activer le service au boot et le démarrer
+      ansible.builtin.systemd:
+        name: todolist
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Appliquer les redémarrages en attente
+      ansible.builtin.meta: flush_handlers
+
+    - name: Vérifier que l'application répond
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}/"
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 10
+      delay: 2
+
+  handlers:
+    - name: Redémarrer todolist
+      ansible.builtin.systemd:
+        name: todolist
+        state: restarted
